@@ -1,0 +1,524 @@
+<!-- livebook:{"file_entries":[{"name":"gomoku-qnet-5x5-4-200k.axon","type":"attachment"}]} -->
+
+# 五目並べの動作説明
+
+```elixir
+Mix.install(
+  [
+    {:axon, "~> 0.2.0"},
+    {:exla, "~> 0.3.0"},
+    {:nx, "~> 0.3.0"},
+    {:kino, "~> 0.10.0"}
+  ],
+  config: [
+    nx: [default_backend: EXLA.Backend]
+  ]
+)
+
+defmodule QNet do
+  defstruct [:step_state, :model, :init_fn, :step_fn]
+
+  def build_model() do
+    Axon.input("x", shape: {nil, 12})
+    |> Axon.dense(100)
+    |> Axon.relu()
+    |> Axon.dense(4)
+  end
+
+  def new(opts \\ []) do
+    {model, opts} = Keyword.pop(opts, :model, build_model())
+    {optimizer, _opts} = Keyword.pop(opts, :optimizer, Axon.Optimizers.sgd())
+
+    {init_fn, step_fn} =
+      train_step(
+        model,
+        &Axon.Losses.mean_squared_error(&1, &2, reduction: :mean),
+        optimizer
+      )
+
+    %QNet{
+      step_state: nil,
+      model: model,
+      step_fn: step_fn,
+      init_fn: init_fn
+    }
+  end
+
+  def init_step_state(%QNet{step_state: nil} = q_net, inp) do
+    %QNet{q_net | step_state: q_net.init_fn.({inp, 0}, %{})}
+  end
+
+  def backword(%QNet{step_state: nil} = q_net, {inp, a, tar}) do
+    backword(init_step_state(q_net, inp), {inp, a, tar})
+  end
+
+  def backword(%QNet{} = q_net, {inp, a, tar}) do
+    new_step_state = q_net.step_fn.({%{"x" => inp}, a, tar}, q_net.step_state)
+    %QNet{q_net | step_state: new_step_state}
+  end
+
+  def forward(inp, %QNet{step_state: nil} = q_net) do
+    forward(inp, init_step_state(q_net, inp))
+  end
+
+  def forward(inp, %QNet{} = q_net) do
+    Axon.predict(q_net.model, q_net.step_state.model_state, %{"x" => inp})
+  end
+
+  def train_step(model, loss_fn, {init_optimizer_fn, update_optimizer_fn}) do
+    {init_model_fn, forward_model_fn} = Axon.build(model, mode: :train)
+
+    init_fn = fn {inp, _}, init_model_state ->
+      model_state = init_model_fn.(inp, init_model_state)
+      optimizer_state = init_optimizer_fn.(model_state)
+
+      %{
+        i: Nx.tensor(0),
+        y_true: Nx.tensor(0.0),
+        y_pred: Nx.tensor(0.0),
+        loss: Nx.tensor(0.0),
+        model_state: model_state,
+        optimizer_state: optimizer_state
+      }
+    end
+
+    objective_fn = fn state, inp, a, tar ->
+      model_out = forward_model_fn.(state, inp)
+
+      model_out = %{
+        model_out
+        | prediction: Nx.take_along_axis(model_out.prediction, a, axis: 1)
+      }
+
+      {model_out, loss_fn.(tar, model_out.prediction)}
+    end
+
+    step_fn = fn {inp, a, tar}, state ->
+      %{i: i, model_state: model_state, optimizer_state: optimizer_state, loss: loss} = state
+
+      {{model_out, batch_loss}, gradients} =
+        Nx.Defn.value_and_grad(
+          model_state,
+          &objective_fn.(&1, inp, a, tar),
+          fn x -> elem(x, 1) end
+        )
+
+      preds = model_out.prediction
+      new_state = model_out.state
+
+      new_loss =
+        loss
+        |> Nx.multiply(i)
+        |> Nx.add(batch_loss)
+        |> Nx.divide(Nx.add(i, 1))
+
+      {updates, new_optimizer_state} =
+        update_optimizer_fn.(gradients, optimizer_state, model_state)
+
+      new_model_state = Axon.Updates.apply_updates(model_state, updates, new_state)
+
+      %{
+        state
+        | i: Nx.add(i, 1),
+          y_true: tar,
+          y_pred: preds,
+          loss: new_loss,
+          model_state: new_model_state,
+          optimizer_state: new_optimizer_state
+      }
+    end
+
+    {
+      Nx.Defn.jit(init_fn, on_conflict: :reuse),
+      Nx.Defn.jit(step_fn, on_conflict: :reuse)
+    }
+  end
+
+  def get_info(%QNet{step_state: nil}) do
+    {-1, -1}
+  end
+
+  def get_info(%QNet{step_state: step_state}) do
+    {Nx.to_number(step_state.i), Nx.to_number(step_state.loss)}
+  end
+
+  def save_model_state(%QNet{model: model, step_state: step_state}, filename) do
+    serialized = Axon.serialize(model, step_state.model_state)
+    File.write(filename, serialized)
+  end
+
+  def load_model_state(filename) do
+    {model, model_state} =
+      filename
+      |> File.read!()
+      |> Axon.deserialize()
+
+    struct!(QNet, model: model, step_state: %{model_state: model_state})
+  end
+end
+
+defmodule Gomoku do
+  # alias __MODULE__ as Gomoku
+
+  @enforce_keys [:board, :size]
+  defstruct [:board, :size, :turn, :done, :draw, :miss, :k]
+
+  def new(size, k) do
+    board = for x <- 0..(size - 1), y <- 0..(size - 1), into: %{}, do: {{y, x}, 0}
+
+    struct!(Gomoku,
+      board: board,
+      size: size,
+      turn: 1,
+      done: false,
+      draw: false,
+      miss: false,
+      k: k
+    )
+  end
+
+  def get_next_player(%Gomoku{turn: turn}) do
+    turn
+  end
+
+  def can_put(%Gomoku{board: board}, {y, x}) do
+    board[{y, x}] == 0
+  end
+
+  def get_leagal_actions(%Gomoku{size: size} = gomoku) do
+    for y <- 0..(size - 1),
+        x <- 0..(size - 1),
+        can_put(gomoku, {y, x}),
+        do: y * gomoku.size + x
+  end
+
+  def check_full(%Gomoku{size: size} = gomoku) do
+    pos_list = for y <- 0..(size - 1), x <- 0..(size - 1), into: [], do: {y, x}
+
+    Enum.reduce_while(pos_list, true, fn pos, _acc ->
+      if can_put(gomoku, pos), do: {:halt, false}, else: {:cont, true}
+    end)
+  end
+
+  def put!(%Gomoku{done: true} = gomoku, _) do
+    gomoku
+  end
+
+  def put!(%Gomoku{done: false} = gomoku, action) when is_number(action) do
+    put!(gomoku, action_to_xy(action, gomoku))
+  end
+
+  def put!(%Gomoku{board: board, turn: turn} = gomoku, {y, x}) do
+    case board[{y, x}] do
+      0 ->
+        gomoku
+        |> struct(board: %{board | {y, x} => turn})
+        |> update_done({y, x})
+        |> turn_player()
+
+      _ ->
+        struct(gomoku, miss: true, done: true)
+    end
+  end
+
+  def action_to_xy(action, %Gomoku{size: size}) do
+    x = rem(action, size)
+    y = div(action, size)
+    {y, x}
+  end
+
+  def turn_player(%Gomoku{done: true} = gomoku) do
+    gomoku
+  end
+
+  def turn_player(%Gomoku{turn: turn, done: false} = gomoku) do
+    struct!(gomoku, turn: next_player(turn))
+  end
+
+  def next_player(1), do: 2
+  def next_player(_), do: 1
+
+  def count_stones_within_n(_, _, _, _, acc \\ 0)
+
+  def count_stones_within_n(%Gomoku{size: size}, {y, x}, {_dy, _dx}, n, acc)
+      when x < 0 or x >= size or y < 0 or y >= size or n == 0 do
+    acc
+  end
+
+  def count_stones_within_n(
+        %Gomoku{board: board, turn: turn} = gomoku,
+        {y, x},
+        {dy, dx},
+        n,
+        acc
+      ) do
+    cond do
+      board[{y, x}] == turn ->
+        count_stones_within_n(gomoku, {y + dy, x + dx}, {dy, dx}, n - 1, acc + 1)
+
+      board[{y, x}] == 0 ->
+        count_stones_within_n(gomoku, {y + dy, x + dx}, {dy, dx}, n - 1, acc)
+
+      true ->
+        acc
+    end
+  end
+
+  def count_stones_within_5(gomoku, {y, x}, {dy, dx}, n) do
+    side1 = count_stones_within_n(gomoku, {y + dy, x + dx}, {dy, dx}, n)
+    side2 = count_stones_within_n(gomoku, {y - dy, x - dx}, {-dy, -dx}, 4 - n)
+    myself = 1
+    side1 + myself + side2
+  end
+
+  def count_stones_within_5(gomoku, pos, dydx) do
+    for n <- 0..4 do
+      count_stones_within_5(gomoku, pos, dydx, n)
+    end
+    |> Enum.max()
+  end
+
+  def count_stones_within_5(gomoku, pos) do
+    for dydx <- [{0, 1}, {1, 0}, {1, 1}, {1, -1}] do
+      count_stones_within_5(gomoku, pos, dydx)
+    end
+    |> Enum.max()
+  end
+
+  def count_same_value_continues(%Gomoku{size: size}, {y, x}, {_dy, _dx})
+      when x < 0 or x >= size or y < 0 or y >= size do
+    0
+  end
+
+  def count_same_value_continues(
+        %Gomoku{board: board, turn: turn} = gomoku,
+        {y, x},
+        {dy, dx}
+      ) do
+    cond do
+      board[{y, x}] == turn ->
+        1 + count_same_value_continues(gomoku, {y + dy, x + dx}, {dy, dx})
+
+      true ->
+        0
+    end
+  end
+
+  def count_same_value_continues_both_side(%Gomoku{} = gomoku, {y, x}, {dy, dx}) do
+    side1 = count_same_value_continues(gomoku, {y + dy, x + dx}, {dy, dx})
+    side2 = count_same_value_continues(gomoku, {y - dy, x - dx}, {-dy, -dx})
+    myself = 1
+    side1 + myself + side2
+  end
+
+  def update_done(%Gomoku{k: k} = gomoku, pos) do
+    success =
+      count_same_value_continues_both_side(gomoku, pos, {0, 1}) == k ||
+        count_same_value_continues_both_side(gomoku, pos, {1, 1}) == k ||
+        count_same_value_continues_both_side(gomoku, pos, {1, -1}) == k ||
+        count_same_value_continues_both_side(gomoku, pos, {1, 0}) == k
+
+    draw = check_full(gomoku) and not success
+
+    done = draw or success
+
+    struct!(gomoku, done: done, draw: draw)
+  end
+
+  def render_line(%Gomoku{board: board, size: size}, line) do
+    for x <- 0..(size - 1), reduce: "#{line + 1}: " do
+      acc -> acc <> to_display_char(board[{line, x}])
+    end
+  end
+
+  def render(%Gomoku{size: size} = gomoku) do
+    for y <- 0..(size - 1), reduce: "   abcde\n" do
+      acc -> acc <> render_line(gomoku, y) <> "\n"
+    end
+
+    # |> tap(&IO.puts(&1))
+  end
+
+  def to_display_char(value) do
+    table = %{0 => "-", 1 => "○", 2 => "●"}
+    table[value]
+  end
+
+  def to_array(%Gomoku{} = gomoku) do
+    ally = to_array(gomoku, gomoku.turn)
+    enemy = to_array(gomoku, next_player(gomoku.turn))
+    [ally, enemy]
+  end
+
+  def to_array(%Gomoku{board: board, size: size}, target) do
+    for y <- 0..(size - 1) do
+      for x <- 0..(size - 1), do: if(board[{y, x}] == target, do: 1, else: 0)
+    end
+  end
+end
+
+defmodule Dqn do
+  def get_action(%Gomoku{} = gomoku, %QNet{} = qnet) do
+    inp = Nx.tensor([Gomoku.to_array(gomoku)])
+    q = Nx.to_flat_list(QNet.forward(inp, qnet))
+
+    Gomoku.get_leagal_actions(gomoku)
+    |> Enum.map(fn action -> {action, Enum.at(q, action)} end)
+    |> Enum.max_by(fn element -> elem(element, 1) end)
+    |> elem(0)
+    |> Gomoku.action_to_xy(gomoku)
+  end
+end
+```
+
+## Gomokuモジュール
+
+newを実行すると、なにも石の置かれていない初期状態のボードの%Gomoku{}を返します。
+
+```elixir
+Gomoku.new(5, 4)
+```
+
+put!()を使って石を置く操作ができます。(1,1)に白（先手）と(2,2)に黒を置いた状態を作ってみます。
+render()を使うとテキストで盤面が表示されます。
+
+```elixir
+Gomoku.new(5, 4)
+|> Gomoku.put!({1, 1})
+|> Gomoku.put!({2, 2})
+|> Gomoku.render()
+|> IO.puts()
+```
+
+先手が(1,4)に置いた時点で、勝った状態です。
+勝つと、done=trueとなります。
+これ以上石を置けなくなります。
+
+```elixir
+gomoku =
+  Gomoku.new(5, 4)
+  |> Gomoku.put!({1, 1})
+  |> Gomoku.put!({3, 1})
+  |> Gomoku.put!({1, 2})
+  |> Gomoku.put!({3, 2})
+  |> Gomoku.put!({1, 3})
+  |> Gomoku.put!({3, 3})
+  |> Gomoku.put!({1, 4})
+  |> tap(fn x -> Gomoku.render(x) |> IO.puts() end)
+
+IO.inspect(gomoku.done, label: "done=")
+IO.inspect(gomoku.turn, label: "turn=")
+```
+
+## AI対戦相手の動作確認
+
+gomoku-qnet-5x5-4-200k.axonは、Axonで作成したニューラルネットワークを強化学習を行い、が学習が完了した時点の状態をファイルに保存したものです。
+これを読み込みます。
+q_netは、盤面の状態を入力に与えると、置く場所ごとの評価値を返すものです。
+
+```elixir
+# 　将来的にlivebookのFILESでアップロードしたファイルを参照できるようになれば使えるかも？
+# q_net = 
+#   Kino.FS.file_path("gomoku-qnet-5x5-4-200k.axon")
+#   |> QNet.load_model_state()
+
+# gomoku-qnet-5x5-4-200k.axonの保存場所を絶対パスで指定する
+q_net = QNet.load_model_state("/home/masa/livebook/gomoku_livemd/gomoku-qnet-5x5-4-200k.axon")
+```
+
+いくつかの盤面でのq_netの出力値をみてみます
+
+```
+   abc
+1: -----
+2: -○○○-
+3: -----
+4: -●●●-
+5: -----
+```
+
+次は、黒の手番です。
+q_netの出力をみてみると、置くと5個並ぶことになる、(1,4)と(1,0)の値が高くなっています。
+Heatmapでも値が高く（白い色）で表示されています。
+
+```elixir
+# 背景を黒、文字の色を白にする
+IO.puts("\e[40m\e[37m")
+
+gomoku =
+  Gomoku.new(5, 4)
+  |> Gomoku.put!({1, 1})
+  |> Gomoku.put!({3, 1})
+  |> Gomoku.put!({1, 2})
+  |> Gomoku.put!({3, 2})
+  |> Gomoku.put!({1, 3})
+  |> Gomoku.put!({3, 3})
+  |> tap(fn x -> Gomoku.render(x) |> IO.puts() end)
+
+IO.puts("\e[0m")
+
+Nx.tensor([Gomoku.to_array(gomoku)])
+|> IO.inspect(label: "in=")
+|> QNet.forward(q_net)
+|> Nx.reshape({5, 5})
+|> IO.inspect(label: "out=")
+|> Nx.to_heatmap()
+```
+
+次は黒の手番です。
+白が２つ並んでいるので、これを止めないと負けます。
+
+```
+   abc
+1: -----
+2: -○○--
+3: --●--
+4: -----
+5: -----
+```
+
+q_netの出力をみてみると、(1,3)が最も高くなっていて正しい手になっています。
+
+```elixir
+# 背景を黒、文字の色を白にする
+IO.puts("\e[40m\e[37m")
+
+gomoku =
+  Gomoku.new(5, 4)
+  |> Gomoku.put!({1, 1})
+  |> Gomoku.put!({2, 2})
+  |> Gomoku.put!({1, 2})
+  |> tap(fn x -> Gomoku.render(x) |> IO.puts() end)
+
+IO.puts("\e[0m")
+
+Nx.tensor([Gomoku.to_array(gomoku)])
+|> IO.inspect(label: "in=")
+|> QNet.forward(q_net)
+|> Nx.reshape({5, 5})
+|> IO.inspect(label: "out=")
+|> Nx.to_heatmap()
+```
+
+q_netの出力の最大値を選ぶ関数Dqn.get_action()を使うことで、次の手を取得する事ができます。
+
+```elixir
+gomoku =
+  Gomoku.new(5, 4)
+  |> Gomoku.put!({1, 1})
+  |> Gomoku.put!({2, 2})
+  |> Gomoku.put!({1, 2})
+  |> tap(fn x -> Gomoku.render(x) |> IO.puts() end)
+
+pos = Dqn.get_action(gomoku, q_net)
+
+IO.inspect(pos, label: "next action")
+
+gomoku
+|> Gomoku.put!(pos)
+|> tap(fn x -> Gomoku.render(x) |> IO.puts() end)
+```
+
+```elixir
+IO.inspect(pos, label: "next move:")
+```
